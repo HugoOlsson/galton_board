@@ -7,15 +7,30 @@ import {
   loadHDRIData
 } from '$renderer/lib/rendering/lighting3d'
 import { AnimatedScene, HotReloadSetting, SpaceSetting } from '$renderer/lib/scene/sceneClass'
+import { createFastText, updateText } from '$renderer/lib/rendering/objects2d'
 import * as THREE from 'three'
 
 const gravity = new THREE.Vector3(0, -9.81, 0)
 const ballRadius = 0.2
 const pegRadius = 1
+const tilesStartColor = new THREE.Color(0x808080)
+
+let collisionCount = 0
+let counterText: any
+let lastShown = -1
+
+const TIME_SPEED = 3
 
 const restitution = 0.4 // 0 = no bounce, 1 = perfectly elastic
 const slop = 1e-4 // small separation to avoid sticking
-const tangentLoss = 0.03 // percent tangential energy loss on bounce
+const tangentLoss = 0.003 // percent tangential energy loss on bounce
+
+const PER_PEG_XZ = 4
+const PER_LAYER_Y = (Math.sqrt(3) / 2) * PER_PEG_XZ
+
+const MAX_POOL_CAPACITY = 50_000
+const TARGET_ACTIVE = 15_000
+const SPAWN_PER_SEC = 7500
 
 const bumpMap = createBumpMap({
   width: 1000,
@@ -25,16 +40,16 @@ const bumpMap = createBumpMap({
 })
 
 const ballMaterial = new THREE.MeshStandardMaterial({
-  color: 0xffffff,
-  roughness: 1.0,
-  metalness: 0.1,
+  color: 0x333333,
+  roughness: 0.5,
+  metalness: 1,
   bumpMap: bumpMap
 })
 
 const pegMaterial = new THREE.MeshStandardMaterial({
-  color: 0xffffff,
+  color: 0x808080,
   roughness: 0.3, // Bit of roughness for realism
-  metalness: 0.85, // Very metallic
+  metalness: 1, // Very metallic
   bumpMap: bumpMap
 })
 
@@ -51,18 +66,6 @@ interface Peg {
   radius: number
 }
 
-/*
-function createBall(radius: number): Ball {
-  const geometry = new THREE.SphereGeometry(radius, 64, 64)
-  const sphere = new THREE.Mesh(geometry, ballMaterial)
-
-  return {
-    mesh: sphere,
-    velocity: new THREE.Vector3(),
-    radius
-  }
-}
-*/
 function createPeg(radius: number): Peg {
   const geometry = new THREE.SphereGeometry(radius, 64, 64)
   const sphere = new THREE.Mesh(geometry, pegMaterial)
@@ -79,81 +82,74 @@ interface PegSetup {
 }
 
 function createPegSetup(): PegSetup {
-  const triangleDepth = 11
+  const depth = 20
   let layerCount = 1
-
   const pegsList: Peg[] = []
   const pegsGroup = new THREE.Group()
 
-  const perPegWidth = 4
-  const perLayerHeight = (Math.sqrt(3) / 2) * perPegWidth
+  const s = PER_PEG_XZ
+  const yStep = PER_LAYER_Y
+  const a = 0.05 * s // use your varianceFactor*s if you like
+  const jitterAmp = 0.04 * s
 
-  for (let iy = 0; iy < triangleDepth; iy++) {
-    for (let ix = 0; ix < layerCount; ix++) {
-      for (let iz = 0; iz < layerCount; iz++) {
+  for (let iy = 0; iy < depth; iy++) {
+    const xShift = (layerCount - 1) * s * 0.5
+    const zShift = (layerCount - 1) * s * 0.5
+
+    // First pass: generate positions for this layer
+    type P = { peg: Peg; x: number; z: number; y: number }
+    const layer: P[] = []
+    let sumX = 0,
+      sumZ = 0
+
+    for (let iz = 0; iz < layerCount; iz++) {
+      // hex-like: alternate rows in X, zero-mean (±a)
+      const rowShiftX = iz & 1 ? +a : -a
+
+      for (let ix = 0; ix < layerCount; ix++) {
         const peg = createPeg(pegRadius)
+        peg.mesh.matrixAutoUpdate = false
 
-        const xShift = (perPegWidth * (layerCount - 1)) / 2
-        peg.mesh.position.set(
-          ix * perPegWidth - xShift,
-          -iy * perLayerHeight,
-          iz * perPegWidth - xShift
-        )
+        // base grid
+        let x = ix * s - xShift + rowShiftX
+        let z = iz * s - zShift
 
-        pegsList.push(peg)
-        pegsGroup.add(peg.mesh)
+        // small parity-based micro-shifts with zero mean inside the layer
+        // (avoid repeating corridors without introducing drift)
+        const microX = iy & 1 ? (ix & 1 ? +0.5 * a : -0.5 * a) : 0
+        const microZ = iy & 2 ? (iz & 1 ? +0.5 * a : -0.5 * a) : 0
+        x += microX
+        z += microZ
+
+        // tiny zero-mean jitter
+        x += (Math.random() - 0.5) * jitterAmp
+        z += (Math.random() - 0.5) * jitterAmp
+
+        const y = -iy * yStep
+
+        layer.push({ peg, x, z, y })
+        sumX += x
+        sumZ += z
       }
+    }
+
+    // Center-correct this layer exactly
+    const n = layer.length
+    const meanX = sumX / n
+    const meanZ = sumZ / n
+
+    // Second pass: place pegs with mean removed
+    for (const p of layer) {
+      p.peg.mesh.position.set(p.x - meanX, p.y, p.z - meanZ)
+      p.peg.mesh.updateMatrix()
+      pegsList.push(p.peg)
+      pegsGroup.add(p.peg.mesh)
     }
 
     layerCount++
   }
 
-  return {
-    list: pegsList,
-    group: pegsGroup
-  }
-}
-
-function createGrid(): THREE.GridHelper {
-  const size = 20 // total side length
-  const divisions = 20 // number of cells per side
-  const grid = new THREE.GridHelper(size, divisions, 0xffffff, 0x666666)
-  grid.position.y = 0
-  grid.material.opacity = 0.7 // make it subtle
-  grid.material.transparent = true
-  return grid
-}
-
-const pegWorld = new THREE.Vector3()
-const delta = new THREE.Vector3()
-let normal = new THREE.Vector3()
-const velocityNormal = new THREE.Vector3()
-const tangentialVelocity = new THREE.Vector3()
-
-function resolveBallPeg(ball: Ball, peg: Peg) {
-  peg.mesh.getWorldPosition(pegWorld)
-
-  delta.subVectors(ball.mesh.position, pegWorld)
-  const rSum = ball.radius + peg.radius
-  const distanceSquared = delta.lengthSq()
-  const rSumSquared = rSum * rSum
-
-  if (distanceSquared >= rSumSquared) return
-
-  const dist = Math.sqrt(Math.max(distanceSquared, 1e-12))
-  normal.copy(delta).multiplyScalar(1 / dist)
-
-  const penetration = rSum - dist + slop
-  ball.mesh.position.addScaledVector(normal, penetration)
-
-  const vdotn = ball.velocity.dot(normal)
-  if (vdotn < 0) {
-    ball.velocity.addScaledVector(normal, -(1 + restitution) * vdotn)
-
-    velocityNormal.copy(normal).multiplyScalar(ball.velocity.dot(normal)) // normal component after reflection
-    tangentialVelocity.copy(ball.velocity).sub(velocityNormal)
-    ball.velocity.addScaledVector(tangentialVelocity, -tangentLoss)
-  }
+  return { list: pegsList, group: pegsGroup }
 }
 
 interface CubeGrid {
@@ -165,12 +161,7 @@ interface CubeGrid {
   yPlane: number
 }
 
-function createCubeGrid({
-  size = 40,
-  divisions = 20,
-  yPlane = 0,
-  baseOpacity = 0.45
-} = {}): CubeGrid {
+function createCubeGrid({ size = 40, divisions = 20, yPlane = 0 } = {}): CubeGrid {
   const group = new THREE.Group()
   const cells: THREE.Mesh[] = []
   const cellSize = size / divisions
@@ -182,11 +173,10 @@ function createCubeGrid({
   for (let gz = 0; gz < divisions; gz++) {
     for (let gx = 0; gx < divisions; gx++) {
       const mat = new THREE.MeshStandardMaterial({
-        color: 0x3399ff,
-        transparent: true,
-        opacity: baseOpacity,
-        roughness: 0.9,
-        metalness: 0.0
+        color: tilesStartColor,
+        transparent: false,
+        roughness: 0.8,
+        metalness: 0
       })
 
       const m = new THREE.Mesh(geo, mat)
@@ -205,16 +195,7 @@ function createCubeGrid({
 
   return { group, cells, size, divisions, cellSize, yPlane }
 }
-/*
-function addBall(dmScene: AnimatedScene) {
-  const ball = createBall(ballRadius)
-  ball.mesh.position.x = (Math.random() - 0.5) * 0.1
-  ball.mesh.position.z = (Math.random() - 0.5) * 0.1
-  ball.mesh.position.y = 65
-  dmScene.add(ball.mesh)
-  balls.push(ball)
-}
-*/
+
 class BallPool {
   private inactive: Ball[] = []
   public active: Ball[] = [] // dense list; removal uses swap-pop
@@ -294,7 +275,7 @@ class BallPool {
   }
 }
 
-const hdriData = await loadHDRIData(HDRIs.photoStudio1, 2, 1)
+const hdriData = await loadHDRIData(HDRIs.photoStudio2, 2, 1)
 
 export function galtonBoardScene(): AnimatedScene {
   return new AnimatedScene(
@@ -307,50 +288,69 @@ export function galtonBoardScene(): AnimatedScene {
 
       addBackgroundGradient({
         scene: dmScene,
-        topColor: 0x0c8ccd, // blue-ish
-        bottomColor: 0x000000, // black
+        topColor: 0xffffff,
+        bottomColor: 0xffffff,
         lightingIntensity: 10,
-        backgroundOpacity: 0.5
+        backgroundOpacity: 1
       })
 
       const pool = new BallPool(dmScene.scene, {
-        capacity: 3000, // total preallocated
+        capacity: MAX_POOL_CAPACITY, // total preallocated
         radius: ballRadius,
         material: ballMaterial, // your material
-        spawnY: 80
+        spawnY: 100
       })
 
-      const targetActive = 250 // simulate at most this many at once
-      const spawnPerSec = 120 // steady inflow
       let spawnAccum = 0
 
       const yKill = -2 // when below this -> retire
 
-      addSceneLighting(dmScene.scene)
+      addSceneLighting(dmScene.scene, { colorScheme: 'studio' })
 
+      // --- pegs ---
       const pegsSetup = createPegSetup()
-      pegsSetup.group.position.y = 75
-
+      pegsSetup.group.position.y = 95
       dmScene.add(pegsSetup.group)
 
-      const cubeGrid = createCubeGrid({ size: 140, divisions: 65, yPlane: 0, baseOpacity: 0.8 })
+      // Build broad-phase once (cell sizes ≈ peg spacing)
+      pegsSetup.group.updateMatrixWorld(true)
+      const pegIndex = buildPegSpatialIndex(pegsSetup, {
+        cellX: PER_PEG_XZ,
+        cellY: PER_LAYER_Y,
+        cellZ: PER_PEG_XZ
+      })
+
+      const cubeGrid = createCubeGrid({ size: 140, divisions: 65, yPlane: 0 })
       dmScene.add(cubeGrid.group)
 
-      dmScene.camera.position.set(1.234074, 45.59445, 112.5189)
+      // Camera starting position
+      dmScene.camera.position.set(-0.03595941, 34.94228, 163.5067)
 
-      dmScene.camera.quaternion.set(-0.1713081, 0.003481703, 0.000605397, 0.9852112)
+      dmScene.camera.quaternion.set(0.02028413, -0.002545129, 0.00005163652, 0.999791)
 
-      const LOOK_AT = new THREE.Vector3(0, 0, 0)
+      const LOOK_AT = new THREE.Vector3(0, 40, 0)
       const baseRadius = dmScene.camera.position.distanceTo(LOOK_AT)
       let angle = 0
 
+      // HUD holder that rides with the camera
+      const hud = new THREE.Group()
+      dmScene.add(hud)
+
+      // Place in camera space: x=left/right, y=up/down, z<0 is in front of camera
+      hud.position.set(0, 105, 0)
+
+      // Create the 3D text
+      counterText = await createFastText('Collisions: 0', 3, 0x000000)
+
+      hud.add(counterText)
+
       let lastTickTime = 0
       dmScene.onEachTick((tick, time) => {
-        const dt = (time - lastTickTime) / 1000
+        const dt = (TIME_SPEED * (time - lastTickTime)) / 1000
         lastTickTime = time
 
-        spawnAccum += spawnPerSec * dt
-        const want = Math.min(targetActive - pool.active.length, Math.floor(spawnAccum))
+        spawnAccum += SPAWN_PER_SEC * dt
+        const want = Math.min(TARGET_ACTIVE - pool.active.length, Math.floor(spawnAccum))
         for (let i = 0; i < want; i++) pool.spawn()
         spawnAccum -= want
 
@@ -363,10 +363,10 @@ export function galtonBoardScene(): AnimatedScene {
           b.velocity.addScaledVector(gravity, dt)
           b.mesh.position.addScaledVector(b.velocity, dt)
 
-          // collide with pegs
-          for (const peg of pegsSetup.list) {
-            resolveBallPeg(b, peg)
-          }
+          // collide with nearby pegs (numeric-hash broad-phase)
+          resolveBallPegSpatial(b, pegIndex, () => {
+            collisionCount++
+          })
 
           // count downward crossing of the tiles plane using the bottom of the ball
           const plane = cubeGrid.yPlane
@@ -392,9 +392,15 @@ export function galtonBoardScene(): AnimatedScene {
         dmScene.camera.position.x = Math.sin(angle) * baseRadius
         dmScene.camera.position.z = Math.cos(angle) * baseRadius
         dmScene.camera.lookAt(LOOK_AT)
+
+        if (collisionCount !== lastShown) {
+          lastShown = collisionCount
+          updateText(counterText, `Collisions: ${collisionCount.toLocaleString()}`)
+        }
+        hud.lookAt(dmScene.camera.position)
       })
 
-      dmScene.addWait(5000_000)
+      dmScene.addWait(40_000)
     }
   )
 }
@@ -417,14 +423,150 @@ function incrementCell(grid: CubeGrid, index: number, dh = 0.3) {
   m.position.y = grid.yPlane + h * 0.5
 
   // Define your two colors
-  const colorA = new THREE.Color(0x0000ff) // Blue
-  const colorB = new THREE.Color(0xff0000) // Red
+  const colorA = new THREE.Color(0x777777)
+  const colorB = new THREE.Color(0x000000)
 
   // Normalize h to 0-1 range (adjust min/max based on your expected h range)
   const minH = 0.001
-  const maxH = 20.0 // adjust based on your max expected height
+  const maxH = 5.0 // adjust based on your max expected height
   const t = Math.min(1, Math.max(0, (h - minH) / (maxH - minH)))
 
   // Interpolate between colors
   ;(m.material as any).color = new THREE.Color().lerpColors(colorA, colorB, t)
+}
+
+// ---- Numeric key packing (solution 1) ----
+const BASE = 1 << 17 // 131,072
+const OFF = BASE >> 1 // bias to support negatives
+const B2 = BASE * BASE // stride for +1 in X
+
+const packKey = (ix: number, iy: number, iz: number) =>
+  ((ix + OFF) * BASE + (iy + OFF)) * BASE + (iz + OFF)
+
+// Precompute the 27 neighbor offsets (dx * B2 + dy * BASE + dz)
+const NEIGHBOR_OFFS: number[] = []
+for (let dz = -1; dz <= 1; dz++)
+  for (let dy = -1; dy <= 1; dy++)
+    for (let dx = -1; dx <= 1; dx++) NEIGHBOR_OFFS.push(dx * B2 + dy * BASE + dz)
+
+interface PegSpatialIndex {
+  px: Float32Array
+  py: Float32Array
+  pz: Float32Array // world centers
+  buckets: Map<number, number[]> // packedKey -> peg indices
+  cellX: number
+  cellY: number
+  cellZ: number
+  count: number
+}
+
+function buildPegSpatialIndex(
+  setup: PegSetup,
+  { cellX, cellY, cellZ }: { cellX: number; cellY: number; cellZ: number }
+): PegSpatialIndex {
+  // Make sure world matrices reflect group transforms
+  setup.group.updateMatrixWorld(true)
+
+  const n = setup.list.length
+  const px = new Float32Array(n)
+  const py = new Float32Array(n)
+  const pz = new Float32Array(n)
+  const buckets = new Map<number, number[]>()
+
+  for (let i = 0; i < n; i++) {
+    // Read world position from matrixWorld directly (no allocations)
+    const e = setup.list[i].mesh.matrixWorld.elements
+    const x = e[12],
+      y = e[13],
+      z = e[14]
+    px[i] = x
+    py[i] = y
+    pz[i] = z
+
+    const ix = Math.floor(x / cellX)
+    const iy = Math.floor(y / cellY)
+    const iz = Math.floor(z / cellZ)
+    const key = packKey(ix, iy, iz)
+
+    let arr = buckets.get(key)
+    if (!arr) {
+      arr = []
+      buckets.set(key, arr)
+    }
+    arr.push(i)
+  }
+
+  return { px, py, pz, buckets, cellX, cellY, cellZ, count: n }
+}
+
+// Precompute collision constants (radii are constants)
+const RSUM = ballRadius + pegRadius
+const RSUM2 = RSUM * RSUM
+
+function resolveBallPegSpatial(
+  ball: Ball,
+  idx: PegSpatialIndex,
+  onCollide?: (pegIndex: number) => void
+) {
+  const bx = ball.mesh.position.x
+  const by = ball.mesh.position.y
+  const bz = ball.mesh.position.z
+
+  const ix = Math.floor(bx / idx.cellX)
+  const iy = Math.floor(by / idx.cellY)
+  const iz = Math.floor(bz / idx.cellZ)
+
+  const baseKey = packKey(ix, iy, iz)
+
+  // 27 neighbor buckets
+  for (let n = 0; n < 27; n++) {
+    const arr = idx.buckets.get(baseKey + NEIGHBOR_OFFS[n])
+    if (!arr) continue
+
+    for (let k = 0; k < arr.length; k++) {
+      const j = arr[k]
+
+      // delta = ball - peg
+      const dx = bx - idx.px[j]
+      const dy = by - idx.py[j]
+      const dz = bz - idx.pz[j]
+      const d2 = dx * dx + dy * dy + dz * dz
+      if (d2 >= RSUM2) continue
+
+      // contact normal
+      const dist = Math.sqrt(Math.max(d2, 1e-12))
+      const inv = 1 / dist
+      const nx = dx * inv,
+        ny = dy * inv,
+        nz = dz * inv
+
+      // positional correction with slop
+      const penetration = RSUM - dist + slop
+      ball.mesh.position.x += nx * penetration
+      ball.mesh.position.y += ny * penetration
+      ball.mesh.position.z += nz * penetration
+
+      // velocity response
+      const v = ball.velocity
+      const vdotn = v.x * nx + v.y * ny + v.z * nz
+      if (vdotn < 0) {
+        // bounce (restitution)
+        const bounce = -(1 + restitution) * vdotn
+        v.x += nx * bounce
+        v.y += ny * bounce
+        v.z += nz * bounce
+
+        // tangential damping
+        const vdotn2 = v.x * nx + v.y * ny + v.z * nz // after bounce
+        const tx = v.x - vdotn2 * nx
+        const ty = v.y - vdotn2 * ny
+        const tz = v.z - vdotn2 * nz
+        v.x += -tangentLoss * tx
+        v.y += -tangentLoss * ty
+        v.z += -tangentLoss * tz
+
+        if (onCollide) onCollide(j)
+      }
+    }
+  }
 }
