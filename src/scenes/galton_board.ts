@@ -9,9 +9,12 @@ import {
 import { AnimatedScene, HotReloadSetting, SpaceSetting } from '$renderer/lib/scene/sceneClass'
 import { createFastText, updateText } from '$renderer/lib/rendering/objects2d'
 import * as THREE from 'three'
+import { moveCameraAnimation3D, rotateCamera3D } from '$renderer/lib/animation/animations'
+import { createAnim } from '$renderer/lib/animation/protocols'
+import { easeInOutQuad } from '$renderer/lib/animation/interpolations'
 
 const gravity = new THREE.Vector3(0, -9.81, 0)
-const ballRadius = 0.2
+const ballRadius = 0.27
 const pegRadius = 1
 const tilesStartColor = new THREE.Color(0x808080)
 
@@ -19,11 +22,9 @@ let collisionCount = 0
 let counterText: any
 let lastShown = -1
 
-const TIME_SPEED = 3
+const TIME_SPEED = 2.5
 
-const restitution = 0.4 // 0 = no bounce, 1 = perfectly elastic
-const slop = 1e-4 // small separation to avoid sticking
-const tangentLoss = 0.003 // percent tangential energy loss on bounce
+const restitution = 0.3 // 0 = no bounce, 1 = perfectly elastic
 
 const PER_PEG_XZ = 4
 const PER_LAYER_Y = (Math.sqrt(3) / 2) * PER_PEG_XZ
@@ -90,7 +91,7 @@ function createPegSetup(): PegSetup {
   const s = PER_PEG_XZ
   const yStep = PER_LAYER_Y
   const a = 0.05 * s // use your varianceFactor*s if you like
-  const jitterAmp = 0.04 * s
+  const jitterAmp = 0.02 * s
 
   for (let iy = 0; iy < depth; iy++) {
     const xShift = (layerCount - 1) * s * 0.5
@@ -165,7 +166,7 @@ function createCubeGrid({ size = 40, divisions = 20, yPlane = 0 } = {}): CubeGri
   const group = new THREE.Group()
   const cells: THREE.Mesh[] = []
   const cellSize = size / divisions
-  const inset = 0.92 // slight shrink so there’s a gap between cells
+  const inset = 0.95 // slight shrink so there’s a gap between cells
 
   // Reuse one geometry; individual materials optional but cheap at this scale
   const geo = new THREE.BoxGeometry(cellSize * inset, 1, cellSize * inset)
@@ -279,8 +280,8 @@ const hdriData = await loadHDRIData(HDRIs.photoStudio2, 2, 1)
 
 export function galtonBoardScene(): AnimatedScene {
   return new AnimatedScene(
-    1080,
-    1080,
+    2000,
+    2000,
     SpaceSetting.ThreeDim,
     HotReloadSetting.BeginFromCurrent,
     async (dmScene) => {
@@ -303,7 +304,7 @@ export function galtonBoardScene(): AnimatedScene {
 
       let spawnAccum = 0
 
-      const yKill = -2 // when below this -> retire
+      const yKill = -ballRadius * 2 // when below this -> retire
 
       addSceneLighting(dmScene.scene, { colorScheme: 'studio' })
 
@@ -320,7 +321,7 @@ export function galtonBoardScene(): AnimatedScene {
         cellZ: PER_PEG_XZ
       })
 
-      const cubeGrid = createCubeGrid({ size: 140, divisions: 65, yPlane: 0 })
+      const cubeGrid = createCubeGrid({ size: 140, divisions: 53, yPlane: 0 })
       dmScene.add(cubeGrid.group)
 
       // Camera starting position
@@ -340,7 +341,7 @@ export function galtonBoardScene(): AnimatedScene {
       hud.position.set(0, 105, 0)
 
       // Create the 3D text
-      counterText = await createFastText('Collisions: 0', 3, 0x000000)
+      counterText = await createFastText('Collisions: 0', 6.5, 0x000000)
 
       hud.add(counterText)
 
@@ -388,11 +389,6 @@ export function galtonBoardScene(): AnimatedScene {
           i++
         }
 
-        angle += 0.005
-        dmScene.camera.position.x = Math.sin(angle) * baseRadius
-        dmScene.camera.position.z = Math.cos(angle) * baseRadius
-        dmScene.camera.lookAt(LOOK_AT)
-
         if (collisionCount !== lastShown) {
           lastShown = collisionCount
           updateText(counterText, `Collisions: ${collisionCount.toLocaleString()}`)
@@ -400,7 +396,67 @@ export function galtonBoardScene(): AnimatedScene {
         hud.lookAt(dmScene.camera.position)
       })
 
-      dmScene.addWait(40_000)
+      const rotationAnimation = createAnim(easeInOutQuad(0, 2 * Math.PI, 9000), (value) => {
+        dmScene.camera.position.x = Math.sin(value) * baseRadius
+        dmScene.camera.position.z = Math.cos(value) * baseRadius
+        dmScene.camera.lookAt(LOOK_AT)
+      })
+
+      dmScene.addAnim(rotationAnimation)
+
+      const MDAnimationTime = 1500
+      dmScene.do((startTick) => {
+        const endPos = new THREE.Vector3(0, -150, 0)
+
+        const moveAnimation = moveCameraAnimation3D(
+          dmScene.camera,
+          dmScene.camera.position.clone(),
+          endPos,
+          MDAnimationTime
+        )
+
+        const baseUpdater = moveAnimation.updater
+
+        moveAnimation.updater = (interp, sceneTick, isLast) => {
+          // 1) do the position update
+          baseUpdater(interp, sceneTick, isLast)
+          dmScene.camera.lookAt(LOOK_AT)
+        }
+
+        dmScene.insertAnimAt(startTick, moveAnimation)
+      })
+
+      dmScene.addWait(MDAnimationTime)
+
+      // Stay to look at the bottom
+      dmScene.addWait(6000)
+
+      // Move back
+      const MBAnimationTime = 1500
+      dmScene.do((startTick) => {
+        const endPos = new THREE.Vector3(-0.03595941, 34.94228, 163.5067)
+
+        const moveAnimation = moveCameraAnimation3D(
+          dmScene.camera,
+          dmScene.camera.position.clone(),
+          endPos,
+          MBAnimationTime
+        )
+
+        const baseUpdater = moveAnimation.updater
+
+        moveAnimation.updater = (interp, sceneTick, isLast) => {
+          // 1) do the position update
+          baseUpdater(interp, sceneTick, isLast)
+          dmScene.camera.lookAt(LOOK_AT)
+        }
+
+        dmScene.insertAnimAt(startTick, moveAnimation)
+      })
+
+      dmScene.addWait(MBAnimationTime)
+
+      dmScene.addAnim(rotationAnimation.copy().scaleLength(1.25))
     }
   )
 }
@@ -423,12 +479,12 @@ function incrementCell(grid: CubeGrid, index: number, dh = 0.3) {
   m.position.y = grid.yPlane + h * 0.5
 
   // Define your two colors
-  const colorA = new THREE.Color(0x777777)
-  const colorB = new THREE.Color(0x000000)
+  const colorA = new THREE.Color(0x000000)
+  const colorB = new THREE.Color(0x054afa)
 
   // Normalize h to 0-1 range (adjust min/max based on your expected h range)
   const minH = 0.001
-  const maxH = 5.0 // adjust based on your max expected height
+  const maxH = 10.0 // adjust based on your max expected height
   const t = Math.min(1, Math.max(0, (h - minH) / (maxH - minH)))
 
   // Interpolate between colors
@@ -507,18 +563,32 @@ function resolveBallPegSpatial(
   ball: Ball,
   idx: PegSpatialIndex,
   onCollide?: (pegIndex: number) => void
-) {
-  const bx = ball.mesh.position.x
-  const by = ball.mesh.position.y
-  const bz = ball.mesh.position.z
+): boolean {
+  // Tunables (local to keep this self-contained)
+  const PEN_SLOP = 1e-3 // ignore tiny interpenetrations
+  const POS_CORRECTION_FRACTION = 0.8 // 0..1 split-impulse push fraction
+  const REST_VEL_THRESHOLD = 0.2 // below => treat as resting (no bounce)
+  const MU_K_DEFAULT = 0.12 // fallback kinetic friction
+  const MICRO_BIAS = 1e-4 // tiny extra depenetration to avoid re-hit
+
+  const pegRest = (idx as any).pegRest as Float32Array | undefined
+  const pegMu = (idx as any).pegMu as Float32Array | undefined
+
+  const p = ball.mesh.position
+  const v = ball.velocity
+
+  const bx = p.x,
+    by = p.y,
+    bz = p.z
 
   const ix = Math.floor(bx / idx.cellX)
   const iy = Math.floor(by / idx.cellY)
   const iz = Math.floor(bz / idx.cellZ)
-
   const baseKey = packKey(ix, iy, iz)
 
-  // 27 neighbor buckets
+  let hitAny = false
+
+  // Check 27 neighbor buckets
   for (let n = 0; n < 27; n++) {
     const arr = idx.buckets.get(baseKey + NEIGHBOR_OFFS[n])
     if (!arr) continue
@@ -533,40 +603,64 @@ function resolveBallPegSpatial(
       const d2 = dx * dx + dy * dy + dz * dz
       if (d2 >= RSUM2) continue
 
-      // contact normal
+      // Contact normal
       const dist = Math.sqrt(Math.max(d2, 1e-12))
       const inv = 1 / dist
       const nx = dx * inv,
         ny = dy * inv,
         nz = dz * inv
 
-      // positional correction with slop
-      const penetration = RSUM - dist + slop
-      ball.mesh.position.x += nx * penetration
-      ball.mesh.position.y += ny * penetration
-      ball.mesh.position.z += nz * penetration
+      // --- Position correction (split impulse, zero-energy) ---
+      const rawPen = RSUM - dist // desired pushout
+      const corr = Math.max(0, rawPen - PEN_SLOP) // ignore small
+      if (corr > 0) {
+        const push = POS_CORRECTION_FRACTION * corr
+        p.x += nx * push
+        p.y += ny * push
+        p.z += nz * push
+        // micro bias to avoid immediate re-collision
+        p.x += nx * MICRO_BIAS
+        p.y += ny * MICRO_BIAS
+        p.z += nz * MICRO_BIAS
+        hitAny = true
+      }
 
-      // velocity response
-      const v = ball.velocity
+      // --- Velocity response (bounce + Coulomb friction) ---
       const vdotn = v.x * nx + v.y * ny + v.z * nz
       if (vdotn < 0) {
-        // bounce (restitution)
-        const bounce = -(1 + restitution) * vdotn
-        v.x += nx * bounce
-        v.y += ny * bounce
-        v.z += nz * bounce
+        // Restitution: zero if near-rest impact
+        const baseRest = pegRest ? pegRest[j] : typeof restitution === 'number' ? restitution : 0.3
+        const eEff = -vdotn > REST_VEL_THRESHOLD ? baseRest : 0.0
 
-        // tangential damping
-        const vdotn2 = v.x * nx + v.y * ny + v.z * nz // after bounce
-        const tx = v.x - vdotn2 * nx
-        const ty = v.y - vdotn2 * ny
-        const tz = v.z - vdotn2 * nz
-        v.x += -tangentLoss * tx
-        v.y += -tangentLoss * ty
-        v.z += -tangentLoss * tz
+        // Normal "impulse" (unit mass → delta-v)
+        const Jn = -(1 + eEff) * vdotn
+        v.x += nx * Jn
+        v.y += ny * Jn
+        v.z += nz * Jn
+
+        // Tangential (Coulomb) friction
+        const vdotn2 = v.x * nx + v.y * ny + v.z * nz
+        let tx = v.x - vdotn2 * nx
+        let ty = v.y - vdotn2 * ny
+        let tz = v.z - vdotn2 * nz
+        const vt = Math.hypot(tx, ty, tz)
+        if (vt > 1e-8) {
+          const invVt = 1 / vt
+          tx *= invVt
+          ty *= invVt
+          tz *= invVt // tangential unit vector
+          const mu = pegMu ? pegMu[j] : MU_K_DEFAULT
+          const Jt = Math.min(mu * Math.abs(Jn), vt) // clamp to available tangential speed
+          v.x -= tx * Jt
+          v.y -= ty * Jt
+          v.z -= tz * Jt
+        }
 
         if (onCollide) onCollide(j)
+        hitAny = true
       }
     }
   }
+
+  return hitAny
 }
